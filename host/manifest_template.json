@@ -1,0 +1,35 @@
+[
+  {
+    "id": "etcd",
+    "image": "$image_repository?name=flynn/etcd&id=$image_id[etcd]",
+    "expose_env": ["ETCD_INITIAL_CLUSTER", "ETCD_INITIAL_CLUSTER_STATE", "ETCD_NAME", "ETCD_DISCOVERY", "ETCD_PROXY"],
+    "args": [
+      "-data-dir={{ .Volume \"/data\" }}",
+      "-advertise-client-urls=http://{{ .ExternalIP }}:{{ .TCPPort 0 }}",
+      "-listen-client-urls=http://0.0.0.0:{{ .TCPPort 0 }}",
+      "-initial-advertise-peer-urls=http://{{ .ExternalIP }}:{{ .TCPPort 1 }}",
+      "-listen-peer-urls=http://0.0.0.0:{{ .TCPPort 1 }}",
+      "{{ if and (not .Env.ETCD_INITIAL_CLUSTER) (not .Env.ETCD_DISCOVERY) }}-initial-cluster=default=http://{{ .ExternalIP }}:{{ .TCPPort 1 }}{{ end }}"
+    ],
+    "tcp_ports": ["2379", "2380"]
+  },
+  {
+    "id": "flannel",
+    "image": "$image_repository?name=flynn/flannel&id=$image_id[flannel]",
+    "env": {
+      "FLANNEL_NETWORK": "100.100.0.0/16",
+      "ETCD_ADDR": "{{ .Services.etcd.ExternalIP }}:{{ index .Services.etcd.TCPPorts 0 }}"
+    }
+  },
+  {
+    "id": "discoverd",
+    "image": "$image_repository?name=flynn/discoverd&id=$image_id[discoverd]",
+    "args": [
+      "-http-addr=:{{ .TCPPort 0 }}", 
+      "-dns-addr={{ .BridgeIP }}:{{ .TCPPort 1 }}",
+      "-recursors={{ .Nameservers }}",
+      "-etcd=http://{{ .Services.etcd.ExternalIP }}:{{ index .Services.etcd.TCPPorts 0 }}"
+    ],
+    "tcp_ports": ["1111", "53"]
+  }
+]

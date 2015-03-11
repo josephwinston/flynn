@@ -1,0 +1,107 @@
+#!/bin/bash
+
+set -e
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+source "${ROOT}/script/lib/ui.sh"
+
+usage() {
+  cat <<USAGE >&2
+usage: $0 [options]
+
+OPTIONS:
+  -h            Show this message
+  -b BACKEND    The job backend to use [default: `libvirt-lxc`]
+  -d DOMAIN     The default domain to use [default: `dev.localflynn.com`]
+  -i IP         The external IP address to bind to [default: the IP assigned to `eth0`]
+  -z            Don't destroy volumes
+USAGE
+}
+
+main() {
+  local backend ip
+  local domain="${CLUSTER_DOMAIN}"
+  local destroy_vols=true
+
+  while getopts 'hb:d:i:z' opt; do
+    case $opt in
+      h)
+        usage
+        exit 1
+        ;;
+      b) backend=${OPTARG} ;;
+      d) domain=${OPTARG} ;;
+      i) ip=${OPTARG} ;;
+      z) destroy_vols=false ;;
+      ?)
+        usage
+        exit 1
+        ;;
+    esac
+  done
+  shift $((${OPTIND} - 1))
+
+  if [[ $# -ne 0 ]]; then
+    usage
+    exit 1
+  fi
+
+  backend=${backend:-"libvirt-lxc"}
+  domain="${domain:="dev.localflynn.com"}"
+  ip=${ip:-$(/sbin/ifconfig eth0 \
+    | grep -oP 'inet addr:\S+' \
+    | cut -d: -f2)}
+
+  export DISCOVERD="${ip}:1111"
+  export CLUSTER_DOMAIN="${domain}"
+
+  # kill flynn first
+  "${ROOT}/script/kill-flynn" -b "${backend}"
+
+  # delete the old state
+  sudo rm -f /tmp/flynn-host-state.bolt
+
+  if $destroy_vols; then
+    sudo "${ROOT}/host/bin/flynn-host" destroy-volumes --include-data
+  fi
+
+  case "${backend}" in
+    libvirt-lxc)
+      boot_libvirt_lxc $ip
+      ;;
+    *)
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+boot_libvirt_lxc() {
+  local ip=$1
+  local host_dir="${ROOT}/host"
+  local bootstrap_dir="${ROOT}/bootstrap"
+
+  local log="/tmp/flynn-host-$(date +%Y-%m-%dT%H-%M-%S.%N).log"
+  ln -nfs "${log}" /tmp/flynn-host.log
+  info "starting flynn-host (libvirt-lxc backend)"
+  info "forwarding daemon output to ${log}"
+  sudo start-stop-daemon \
+    --start \
+    --background \
+    --no-close \
+    --exec "${host_dir}/bin/flynn-host" \
+    -- \
+    daemon \
+    --manifest "${host_dir}/bin/manifest.json" \
+    --external ${ip} \
+    --force \
+    --backend libvirt-lxc \
+    --state /tmp/flynn-host-state.bolt \
+    --flynn-init "${host_dir}/bin/flynn-init" \
+    &>"${log}"
+
+  info "bootstrapping Flynn"
+  "${host_dir}/bin/flynn-host" bootstrap "${bootstrap_dir}/bin/manifest.json"
+}
+
+main $@

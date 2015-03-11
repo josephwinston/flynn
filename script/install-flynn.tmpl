@@ -1,0 +1,163 @@
+#!/bin/bash
+#
+# A script to install Flynn from a TUF repository.
+
+FLYNN_HOST_CHECKSUM="${FLYNN_HOST_CHECKSUM:="{{FLYNN-HOST-CHECKSUM}}"}"
+
+usage() {
+  cat <<USAGE >&2
+usage: $0 [options]
+
+OPTIONS:
+  -h            Show this message
+  -r URL        The TUF repository to download files from [default: https://dl.flynn.io]
+  -v            Show verbose output
+USAGE
+}
+
+main() {
+  if ! is_root; then
+    fail "this script must be executed as the root user"
+  fi
+
+  if ! is_ubuntu_trusty; then
+    fail "this script is only compatible with Ubuntu 14.04 LTS, Trusty Tahr"
+  fi
+
+  check_installed "curl" "sha512sum"
+
+  local repo_url
+
+  while getopts 'hr:v' opt; do
+    case $opt in
+      h)
+        usage
+        exit 1
+        ;;
+      r) repo_url=${OPTARG} ;;
+      v) VERBOSE=true ;;
+      ?)
+        usage
+        exit 1
+        ;;
+    esac
+  done
+  shift $((${OPTIND} - 1))
+
+  if [[ $# -ne 0 ]]; then
+    usage
+    exit 1
+  fi
+
+  repo_url="${repo_url:="https://dl.flynn.io"}"
+
+  info "adding zfs-native APT PPA"
+  run apt-key adv --keyserver keyserver.ubuntu.com --recv E871F18B51E0147C77796AC81196BA81F6B0FC61
+  echo deb http://ppa.launchpad.net/zfs-native/stable/ubuntu trusty main > /etc/apt/sources.list.d/zfs.list
+  run apt-get update
+
+  local packages=(
+    "aufs-tools"
+    "iptables"
+    "libvirt-bin"
+    "ubuntu-zfs"
+  )
+  if ! modprobe aufs &>/dev/null; then
+    packages+=(
+      "linux-image-extra-$(uname -r)"
+    )
+  fi
+  info "installing runtime dependencies"
+  run apt-get install --yes ${packages[@]}
+
+  info "downloading flynn-host binary to tmp dir"
+  local tmp="$(mktemp --directory)"
+  trap "rm -rf ${tmp}" EXIT
+  if ! curl -fsSL -o "${tmp}/flynn-host.gz" "${repo_url}/tuf/targets/${FLYNN_HOST_CHECKSUM}.flynn-host.gz"; then
+    fail "failed to download flynn-host binary from ${repo_url}"
+  fi
+
+  info "verifying flynn-host binary checksum"
+  pushd "${tmp}" >/dev/null
+  if ! echo "${FLYNN_HOST_CHECKSUM} *flynn-host.gz" | sha512sum --check --status; then
+    fail "failed to verify flynn-host binary checksum!"
+  fi
+  popd >/dev/null
+
+  info "moving verified flynn-host binary to /usr/local/bin"
+  run gunzip "${tmp}/flynn-host.gz"
+  run mv "${tmp}/flynn-host" "/usr/local/bin/flynn-host"
+  run chmod +x "/usr/local/bin/flynn-host"
+
+  info "downloading Flynn components"
+  mkdir -p "/etc/flynn"
+  run /usr/local/bin/flynn-host download \
+    --repository "${repo_url}/tuf" \
+    --tuf-db     "/etc/flynn/tuf.db" \
+    --config-dir "/etc/flynn" \
+    --bin-dir    "/usr/local/bin"
+  ln -fs "/usr/local/bin/flynn-linux-amd64" "/usr/local/bin/flynn"
+
+  info "setting libvirt defaults"
+  if grep -q "^libvirt_uris=" /etc/default/libvirt-bin; then
+    sed "s|^libvirt_uris=.*|libvirt_uris='qemu:///system'|" -i /etc/default/libvirt-bin
+  else
+    echo "libvirt_uris='qemu:///system'" >> /etc/default/libvirt-bin
+  fi
+
+  info "installing Upstart job"
+  cp /etc/flynn/upstart.conf /etc/init/flynn-host.conf
+  initctl reload-configuration
+
+  info "installation complete!"
+}
+
+is_root() {
+  [[ $(id -u) -eq 0 ]]
+}
+
+is_ubuntu_trusty() {
+  grep "Ubuntu 14.04" "/etc/os-release" &>/dev/null
+}
+
+check_installed() {
+  local missing=()
+
+  for bin in $@; do
+    if ! which "${bin}" &>/dev/null; then
+      missing+=("${bin}")
+    fi
+  done
+
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    fail "this script requires: ${missing[@]}"
+  fi
+}
+
+run() {
+  local cmd=$@
+  info "running \"${cmd}\""
+  $cmd
+
+  local status=$?
+  if [[ $status -ne 0 ]]; then
+    fail "failed to run \"${cmd}\", exit status ${status}"
+  fi
+}
+
+timestamp() {
+  date "+%H:%M:%S.%3N"
+}
+
+info() {
+  local msg=$1
+  echo -e "\e[1;32m===> $(timestamp) ${msg}\e[0m"
+}
+
+fail() {
+  local msg=$1
+  echo -e "\e[1;31m===> $(timestamp) ERROR: ${msg}\e[0m"
+  exit 1
+}
+
+main $@

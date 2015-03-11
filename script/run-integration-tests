@@ -1,0 +1,73 @@
+#!/bin/bash
+
+set -e
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+usage() {
+  cat <<USAGE >&2
+usage: $0 [options]
+
+OPTIONS:
+  -h            Show this message
+  -f FILTER     Regular expression selecting which tests and/or suites to run
+  -s            Stream debug output
+USAGE
+}
+
+main() {
+  local filter
+  local stream=false
+
+  while getopts 'hf:s' opt; do
+    case "${opt}" in
+      h)
+        usage
+        exit 1
+        ;;
+      f) filter="${OPTARG}" ;;
+      s) stream=true ;;
+      ?)
+        usage
+        exit 1
+        ;;
+    esac
+  done
+  shift $((${OPTIND} - 1))
+
+  if [[ $# -ne 0 ]]; then
+    usage
+    exit 1
+  fi
+
+  local flynn="${ROOT}/cli/flynn-cli"
+
+  pushd "${ROOT}" >/dev/null
+  make
+  popd >/dev/null
+
+  cluster_add=$("${ROOT}/script/bootstrap-flynn" &> >(tee /dev/stderr) | tail -3 | head -1)
+
+  if [[ "${cluster_add:0:17}" != "flynn cluster add" ]]; then
+    echo Bootstrap failed >&2
+    exit 1
+  fi
+
+  export FLYNNRC=/tmp/flynnrc
+  "${flynn}" cluster remove default
+  "${flynn}" ${cluster_add:6}
+
+  cd "${ROOT}/test"
+
+  test_args="--flynnrc ${FLYNNRC} --cli ${flynn} --debug"
+  if [[ -n "${filter}" ]]; then
+    test_args="${test_args} --run ${filter}"
+  fi
+  if $stream; then
+    test_args="${test_args} --stream"
+  fi
+
+  bin/flynn-test ${test_args}
+}
+
+main $@

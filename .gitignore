@@ -1,0 +1,7 @@
+.tup
+bin
+*.deb
+.vagrant
+/version.json
+/log
+script/custom-vagrant

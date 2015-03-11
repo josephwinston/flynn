@@ -1,0 +1,36 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+# Fail if Vagrant version is too old
+begin
+  Vagrant.require_version ">= 1.6.0"
+rescue NoMethodError
+  $stderr.puts "This Vagrantfile requires Vagrant version >= 1.6.0"
+  exit 1
+end
+
+# Vagrantfile API/syntax version. Don't touch unless you know what you're doing!
+VAGRANTFILE_API_VERSION = "2"
+
+Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
+  config.vm.box = "flynn-base"
+  config.vm.box_url = "https://dl.flynn.io/vagrant/flynn-base.json"
+  config.vm.box_version = "> 0"
+
+  # RFC 5737 TEST-NET-1 used to avoid DNS rebind protection
+  config.vm.network "private_network", ip: "192.0.2.200"
+
+  config.vm.synced_folder ".", "/vagrant", disabled: true
+
+  config.vm.provision "shell", privileged: false, inline: <<SCRIPT
+    ## Uncomment these lines to update flynn before starting
+    # sudo apt-get update -qq
+    # sudo apt-get install -y flynn-host
+    # sudo flynn-host download /etc/flynn/version.json
+
+    sudo start flynn-host
+
+    CLUSTER_DOMAIN=demo.localflynn.com \
+    flynn-host bootstrap /etc/flynn/bootstrap-manifest.json 2>&1
+SCRIPT
+end
