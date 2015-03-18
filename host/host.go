@@ -14,6 +14,7 @@ import (
 	"github.com/flynn/flynn/discoverd/client"
 	"github.com/flynn/flynn/host/cli"
 	"github.com/flynn/flynn/host/config"
+	"github.com/flynn/flynn/host/logmux"
 	"github.com/flynn/flynn/host/sampi"
 	"github.com/flynn/flynn/host/types"
 	"github.com/flynn/flynn/host/volume"
@@ -22,6 +23,7 @@ import (
 	"github.com/flynn/flynn/pkg/attempt"
 	"github.com/flynn/flynn/pkg/cluster"
 	"github.com/flynn/flynn/pkg/shutdown"
+	"github.com/flynn/flynn/pkg/version"
 )
 
 // discoverdAttempts is the attempt strategy that is used to connect to discoverd.
@@ -57,10 +59,11 @@ options:
 func main() {
 	defer shutdown.Exit()
 
-	usage := `usage: flynn-host [-h|--help] <command> [<args>...]
+	usage := `usage: flynn-host [-h|--help] [--version] <command> [<args>...]
 
 Options:
   -h, --help                 Show this message
+  --version                  Show current version
 
 Commands:
   help                       Show usage for a specific command
@@ -74,12 +77,13 @@ Commands:
   ps                         List jobs
   stop                       Stop running jobs
   destroy-volumes            Destroys the local volume database
-  upload-debug-info          Upload debug information to an anonymous gist
+  collect-debug-info         Collect debug information into an anonymous gist or tarball
+  version                    Show current version
 
 See 'flynn-host help <command>' for more information on a specific command.
 `
 
-	args, _ := docopt.Parse(usage, nil, true, "", true)
+	args, _ := docopt.Parse(usage, nil, true, version.String(), true)
 	cmd := args.String["<command>"]
 	cmdArgs := args.All["<args>"].([]string)
 
@@ -118,6 +122,11 @@ See 'flynn-host help <command>' for more information on a specific command.
 	}
 
 	if err := cli.Run(cmd, cmdArgs); err != nil {
+		if err == cli.ErrInvalidCommand {
+			fmt.Printf("ERROR: %q is not a valid command\n\n", cmd)
+			fmt.Println(usage)
+			shutdown.ExitWithCode(1)
+		}
 		shutdown.Fatal(err)
 	}
 }
@@ -176,9 +185,12 @@ func runDaemon(args *docopt.Args) {
 		shutdown.Fatal(err)
 	}
 
+	mux := logmux.New(1000)
+	shutdown.BeforeExit(func() { mux.Close() })
+
 	switch backendName {
 	case "libvirt-lxc":
-		backend, err = NewLibvirtLXCBackend(state, vman, legacyVolPath, "/tmp/flynn-host-logs", flynnInit)
+		backend, err = NewLibvirtLXCBackend(state, vman, legacyVolPath, "/tmp/flynn-host-logs", flynnInit, mux)
 	default:
 		log.Fatalf("unknown backend %q", backendName)
 	}
@@ -213,6 +225,7 @@ func runDaemon(args *docopt.Args) {
 		vman:         vman,
 	}
 
+	// connect to discoverd
 	discURL := os.Getenv("DISCOVERD")
 	var disc *discoverd.Client
 	if manifestFile != "" {
@@ -263,6 +276,10 @@ func runDaemon(args *docopt.Args) {
 		shutdown.Fatal(err)
 	}
 	shutdown.BeforeExit(func() { hb.Close() })
+
+	if err := mux.Connect(disc, "flynn-logaggregator"); err != nil {
+		shutdown.Fatal(err)
+	}
 
 	cluster, err := cluster.NewClient()
 	if err != nil {

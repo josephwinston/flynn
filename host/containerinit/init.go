@@ -390,7 +390,7 @@ func getCredential(c *Config) (*syscall.Credential, error) {
 	return &syscall.Credential{Uid: uint32(users[0].Uid), Gid: uint32(users[0].Gid)}, nil
 }
 
-func setupCommon(c *Config) error {
+func setupCommon(c *Config, log log15.Logger) error {
 	if err := setupHostname(c); err != nil {
 		return err
 	}
@@ -399,7 +399,29 @@ func setupCommon(c *Config) error {
 		return err
 	}
 
+	setupLimits(log)
+
 	return nil
+}
+
+const RLIMIT_NPROC = 6
+
+func setupLimits(log log15.Logger) {
+	type rlimit struct {
+		resource int
+		value    uint64
+	}
+
+	for _, r := range []rlimit{
+		// bump max fds to 10k
+		{syscall.RLIMIT_NOFILE, 10000},
+		// drop max processes to 256
+		{RLIMIT_NPROC, 256},
+	} {
+		if err := syscall.Setrlimit(r.resource, &syscall.Rlimit{Max: r.value, Cur: r.value}); err != nil {
+			log.Error("error setting rlimit", "err", err)
+		}
+	}
 }
 
 func getCmdPath(c *Config) (string, error) {
@@ -430,7 +452,7 @@ func monitor(port host.Port, container *ContainerInit, env map[string]string, lo
 		// TODO: maybe reuse maybeAddService() from the client
 		log.Info("creating service")
 		if err := client.AddService(config.Name, nil); err != nil {
-			if je, ok := err.(hh.JSONError); !ok || je.Code != hh.ObjectExistsError {
+			if !hh.IsObjectExistsError(err) {
 				log.Error("error creating service", "err", err)
 				return nil, fmt.Errorf("something went wrong with discoverd: %s", err)
 			}
@@ -653,7 +675,7 @@ func containerInitApp(c *Config, logFile *os.File) error {
 	}
 	// Container setup
 	log.Info("setting up the container")
-	if err := setupCommon(c); err != nil {
+	if err := setupCommon(c, log); err != nil {
 		log.Error("error setting up the container", "err", err)
 		init.changeState(StateFailed, err.Error(), -1)
 		init.exit(1)

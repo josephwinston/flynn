@@ -112,6 +112,7 @@ type NewJob struct {
 	TTY        bool              `json:"tty,omitempty"`
 	Columns    int               `json:"tty_columns,omitempty"`
 	Lines      int               `json:"tty_lines,omitempty"`
+	DisableLog bool              `json:"disable_log,omitempty"`
 }
 
 type Deployment struct {
@@ -181,4 +182,11 @@ type ValidationError struct {
 
 func (v ValidationError) Error() string {
 	return fmt.Sprintf("validation error: %s %s", v.Field, v.Message)
+}
+
+type LogOpts struct {
+	Follow      bool
+	JobID       string
+	Lines       *int
+	ProcessType *string
 }

@@ -18,6 +18,7 @@ import (
 	cfg "github.com/flynn/flynn/cli/config"
 	"github.com/flynn/flynn/controller/client"
 	"github.com/flynn/flynn/pkg/shutdown"
+	"github.com/flynn/flynn/pkg/version"
 )
 
 var (
@@ -47,12 +48,12 @@ Commands:
 	apps      list apps
 	ps        list jobs
 	kill      kill a job
-	log       get job log
+	log       get app log
 	scale     change formation
 	run       run a job
 	env       manage env variables
 	route     manage routes
-	psql      open a postgres console
+	pg        manage postgres database
 	provider  manage resource providers
 	resource  provision a new resource
 	key       manage SSH public keys
@@ -61,7 +62,7 @@ Commands:
 
 See 'flynn help <command>' for more information on a specific command.
 `[1:]
-	args, _ := docopt.Parse(usage, nil, true, Version, true)
+	args, _ := docopt.Parse(usage, nil, true, version.String(), true)
 
 	cmd := args.String["<command>"]
 	cmdArgs := args.All["<args>"].([]string)
@@ -90,9 +91,11 @@ See 'flynn help <command>' for more information on a specific command.
 	// Run the update command as early as possible to avoid the possibility of
 	// installations being stranded without updates due to errors in other code
 	if cmd == "update" {
-		runUpdate(cmdArgs)
+		if err := runUpdate(); err != nil {
+			shutdown.Fatal(err)
+		}
 		return
-	} else if updater != nil {
+	} else {
 		defer updater.backgroundRun() // doesn't run if os.Exit is called
 	}
 

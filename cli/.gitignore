@@ -1,2 +1,3 @@
 cli
-flynn-cli
+bin/
+tuf.go

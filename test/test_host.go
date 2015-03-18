@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"io/ioutil"
 	"net/http"
 	"strings"
+	"syscall"
 	"time"
 
 	c "github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-check"
@@ -13,6 +15,7 @@ import (
 	"github.com/flynn/flynn/pkg/cluster"
 	"github.com/flynn/flynn/pkg/exec"
 	"github.com/flynn/flynn/pkg/random"
+	"github.com/flynn/flynn/pkg/schedutil"
 )
 
 type HostSuite struct {
@@ -39,22 +42,30 @@ func (s *HostSuite) TestAttachFinishedInteractiveJob(t *c.C) {
 	// run a quick interactive job
 	cmd := exec.CommandUsingCluster(cluster, exec.DockerImage(imageURIs["test-apps"]), "/bin/true")
 	cmd.TTY = true
-	err := cmd.Run()
-	t.Assert(err, c.IsNil)
+	runErr := make(chan error)
+	go func() {
+		runErr <- cmd.Run()
+	}()
+	select {
+	case err := <-runErr:
+		t.Assert(err, c.IsNil)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for interactive job")
+	}
 
 	h, err := cluster.DialHost(cmd.HostID)
 	t.Assert(err, c.IsNil)
 
 	// Getting the logs for the job should fail, as it has none because it was
 	// interactive
-	done := make(chan struct{})
+	attachErr := make(chan error)
 	go func() {
 		_, err = h.Attach(&host.AttachReq{JobID: cmd.Job.ID, Flags: host.AttachFlagLogs}, false)
-		t.Assert(err, c.NotNil)
-		close(done)
+		attachErr <- err
 	}()
 	select {
-	case <-done:
+	case err := <-attachErr:
+		t.Assert(err, c.NotNil)
 	case <-time.After(time.Second):
 		t.Error("timed out waiting for attach")
 	}
@@ -205,4 +216,44 @@ func (s *HostSuite) TestVolumePersistence(t *c.C) {
 	resp, err = runIshCommand(service, "cat /vol/alpha")
 	t.Assert(err, c.IsNil)
 	t.Assert(resp, c.Equals, "testcontent\n")
+}
+
+func (s *HostSuite) TestSignalJob(t *c.C) {
+	cluster := s.clusterClient(t)
+
+	// pick a host to run the job on
+	hosts, err := cluster.ListHosts()
+	t.Assert(err, c.IsNil)
+	hostID := schedutil.PickHost(hosts).ID
+
+	// start a signal-service job
+	cmd := exec.JobUsingCluster(cluster, exec.DockerImage(imageURIs["test-apps"]), &host.Job{
+		Config: host.ContainerConfig{Cmd: []string{"/bin/signal"}},
+	})
+	cmd.HostID = hostID
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	t.Assert(cmd.Start(), c.IsNil)
+	_, err = s.discoverdClient(t).Instances("signal-service", 10*time.Second)
+	t.Assert(err, c.IsNil)
+
+	// send the job a signal
+	client, err := cluster.DialHost(hostID)
+	t.Assert(err, c.IsNil)
+	t.Assert(client.SignalJob(cmd.Job.ID, int(syscall.SIGTERM)), c.IsNil)
+
+	// wait for the job to exit
+	done := make(chan error)
+	go func() {
+		done <- cmd.Wait()
+	}()
+	select {
+	case err := <-done:
+		t.Assert(err, c.IsNil)
+	case <-time.After(12 * time.Second):
+		t.Fatal("timed out waiting for job to stop")
+	}
+
+	// check the output
+	t.Assert(out.String(), c.Equals, "got signal: terminated")
 }

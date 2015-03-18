@@ -29,7 +29,7 @@ function getJobOutputStoreId (props) {
 		return null;
 	}
 	return {
-		appId: props.appId,
+		appId: "taffy",
 		jobId: props.job.id
 	};
 }
@@ -87,7 +87,7 @@ Dashboard.Views.AppDeployCommit = React.createClass({
 					) : null}
 
 					{this.state.jobOutput ? (
-						<Dashboard.Views.CommandOutput outputStreamData={this.state.jobOutput} />
+						<Dashboard.Views.CommandOutput outputStreamData={this.state.jobOutput} showTimestamp={false} />
 					) : null}
 
 					{this.props.errorMsg ? (

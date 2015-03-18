@@ -80,6 +80,14 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
     grep '^export PATH' ~/.bashrc || echo export PATH=\\\$PATH:~/go/bin:~/go/src/github.com/flynn/flynn/appliance/etcd/bin:~/go/src/github.com/flynn/flynn/discoverd/bin:/vagrant/script >> ~/.bashrc
     GOPATH=~/go go get github.com/tools/godep
 
+    # For script unit tests
+    tmpdir=$(mktemp --directory)
+    trap "rm -rf ${tmpdir}" EXIT
+    git clone https://github.com/sstephenson/bats.git "${tmpdir}/bats"
+    sudo "${tmpdir}/bats/install.sh" /usr/local
+    sudo curl -sLo "/usr/local/bin/jq" "http://stedolan.github.io/jq/download/linux64/jq"
+    sudo chmod +x "/usr/local/bin/jq"
+
     # For controller tests
     sudo apt-get update
     sudo apt-get install -y postgresql postgresql-contrib

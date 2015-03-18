@@ -50,7 +50,7 @@ src="${GOPATH}/src/github.com/flynn/flynn"
   pushd "${src}" >/dev/null
   sed "s/{{TUF-ROOT-KEYS}}/$(tuf --dir test/release root-keys)/g" host/cli/root_keys.go.tmpl > host/cli/root_keys.go
   vpkg="github.com/flynn/flynn/pkg/version"
-  go build -o host/bin/flynn-host -ldflags="-X ${vpkg}.commit dev -X ${vpkg}.branch dev -X ${vpkg}.tag v20150131.0-test -X ${vpkg}.dirty false" ./host
+  go build -o host/bin/flynn-host -ldflags="-X ${vpkg}.commit notdev -X ${vpkg}.branch dev -X ${vpkg}.tag v20150131.0-test -X ${vpkg}.dirty false" ./host
   gzip -9 --keep --force host/bin/flynn-host
   sed "s/{{FLYNN-HOST-CHECKSUM}}/$(sha512sum host/bin/flynn-host.gz | cut -d " " -f 1)/g" script/install-flynn.tmpl > script/install-flynn
 
@@ -103,14 +103,15 @@ func (s *ReleaseSuite) TestReleaseImages(t *c.C) {
 
 	// stream script output to t.Log
 	logReader, logWriter := io.Pipe()
+	defer logWriter.Close()
 	go func() {
 		buf := bufio.NewReader(logReader)
 		for {
 			line, err := buf.ReadString('\n')
-			debug(t, line[0:len(line)-1])
 			if err != nil {
 				return
 			}
+			debug(t, line[0:len(line)-1])
 		}
 	}()
 
@@ -174,18 +175,21 @@ func (s *ReleaseSuite) TestReleaseImages(t *c.C) {
 
 	// check system apps were deployed correctly
 	for _, app := range updater.SystemApps {
+		image := "flynn/" + app
+		if app == "gitreceive" {
+			image = "flynn/receiver"
+		}
+		debugf(t, "checking new %s release is using image %s", app, versions[image])
 		expected := fmt.Sprintf(`"finished deploy of system app" name=%s`, app)
 		if !strings.Contains(updateOutput.String(), expected) {
 			t.Fatalf(`expected update to deploy %s`, app)
 		}
 		release, err := client.GetAppRelease(app)
 		t.Assert(err, c.IsNil)
+		debugf(t, "new %s release ID: %s", app, release.ID)
 		artifact, err := client.GetArtifact(release.ArtifactID)
 		t.Assert(err, c.IsNil)
-		image := "flynn/" + app
-		if app == "gitreceive" {
-			image = "flynn/receiver"
-		}
+		debugf(t, "new %s artifact: %+v", app, artifact)
 		uri, err := url.Parse(artifact.URI)
 		t.Assert(err, c.IsNil)
 		t.Assert(uri.Query().Get("id"), c.Equals, versions[image])

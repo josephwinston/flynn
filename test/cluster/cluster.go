@@ -26,6 +26,7 @@ type ClusterType uint8
 const (
 	ClusterTypeDefault ClusterType = iota
 	ClusterTypeRelease
+	ClusterTypeNone
 )
 
 type BootConfig struct {
@@ -184,7 +185,7 @@ func (c *Cluster) Boot(typ ClusterType, count int, dumpLogs io.Writer, killOnFai
 	}()
 
 	c.log("Booting", count, "VMs")
-	instances, err := c.startVMs(c.rootFS, count, true)
+	instances, err := c.startVMs(typ, c.rootFS, count, true)
 	if err != nil {
 		return nil, err
 	}
@@ -197,13 +198,6 @@ func (c *Cluster) Boot(typ ClusterType, count int, dumpLogs io.Writer, killOnFai
 	c.log("Bootstrapping layer 1...")
 	if err := c.bootstrapLayer1(instances); err != nil {
 		return nil, err
-	}
-
-	switch typ {
-	case ClusterTypeDefault:
-		c.defaultInstances = append(c.defaultInstances, instances...)
-	case ClusterTypeRelease:
-		c.releaseInstances = append(c.releaseInstances, instances...)
 	}
 
 	return &BootResult{
@@ -226,7 +220,7 @@ func (c *Cluster) AddHost() (*Instance, error) {
 		return nil, errors.New("cluster not yet booted")
 	}
 	c.log("Booting 1 VM")
-	instances, err := c.startVMs(c.rootFS, 1, false)
+	instances, err := c.startVMs(ClusterTypeDefault, c.rootFS, 1, false)
 	if err != nil {
 		return nil, err
 	}
@@ -234,13 +228,12 @@ func (c *Cluster) AddHost() (*Instance, error) {
 	if err := c.startFlynnHost(inst, c.defaultInstances); err != nil {
 		return nil, err
 	}
-	c.defaultInstances = append(c.defaultInstances, inst)
 	return inst, err
 }
 
 func (c *Cluster) AddVanillaHost(rootFS string) (*Instance, error) {
 	c.log("Booting 1 VM")
-	instances, err := c.startVMs(rootFS, 1, false)
+	instances, err := c.startVMs(ClusterTypeNone, rootFS, 1, false)
 	return instances[0], err
 }
 
@@ -269,7 +262,8 @@ func (c *Cluster) RemoveHost(id string) error {
 	var cmd string
 	switch c.bc.Backend {
 	case "libvirt-lxc":
-		cmd = "sudo start-stop-daemon --stop --pidfile /var/run/flynn-host.pid --retry 15"
+		// manually kill containers after stopping flynn-host due to https://github.com/flynn/flynn/issues/1177
+		cmd = "sudo start-stop-daemon --stop --pidfile /var/run/flynn-host.pid --retry 15 && (virsh -c lxc:/// list --name | xargs -L 1 virsh -c lxc:/// destroy || true)"
 	}
 	if err := inst.Run(cmd, nil); err != nil {
 		return err
@@ -294,7 +288,7 @@ func (c *Cluster) Size() int {
 	return len(c.Instances)
 }
 
-func (c *Cluster) startVMs(rootFS string, count int, initial bool) ([]*Instance, error) {
+func (c *Cluster) startVMs(typ ClusterType, rootFS string, count int, initial bool) ([]*Instance, error) {
 	uid, gid, err := lookupUser(c.bc.User)
 	if err != nil {
 		return nil, err
@@ -321,6 +315,12 @@ func (c *Cluster) startVMs(rootFS string, count int, initial bool) ([]*Instance,
 		inst.initial = initial
 		instances[i] = inst
 		c.Instances = append(c.Instances, inst)
+		switch typ {
+		case ClusterTypeDefault:
+			c.defaultInstances = append(c.defaultInstances, inst)
+		case ClusterTypeRelease:
+			c.releaseInstances = append(c.releaseInstances, inst)
+		}
 	}
 	return instances, nil
 }
@@ -616,13 +616,6 @@ func (c *Cluster) dumpLogs(w io.Writer) {
 		fmt.Fprintln(w)
 		return err
 	}
-	fallback := func() {
-		fmt.Fprintf(w, "\n*** Error getting job logs via flynn-host, falling back to tail log dump\n\n")
-		for _, inst := range c.Instances {
-			run(inst, "sudo bash -c 'tail -n +1 /tmp/flynn-host-logs/**/*.log'")
-		}
-	}
-
 	fmt.Fprint(w, "\n\n***** ***** ***** DUMPING ALL LOGS ***** ***** *****\n\n")
 	for _, inst := range c.Instances {
 		run(inst, "ps faux")
@@ -630,19 +623,34 @@ func (c *Cluster) dumpLogs(w io.Writer) {
 		run(inst, "cat /tmp/debug-info.log")
 	}
 
-	var out bytes.Buffer
-	if err := c.Run("flynn-host ps -a -q", &Streams{Stdout: &out, Stderr: w}); err != nil {
-		io.Copy(w, &out)
-		fallback()
-		return
-	}
+	printLogs := func(instances []*Instance) {
+		fallback := func() {
+			fmt.Fprintf(w, "\n*** Error getting job logs via flynn-host, falling back to tail log dump\n\n")
+			for _, inst := range instances {
+				run(inst, "sudo bash -c 'tail -n +1 /tmp/flynn-host-logs/**/*.log'")
+			}
+		}
 
-	ids := strings.Split(strings.TrimSpace(out.String()), "\n")
-	for _, id := range ids {
-		if err := run(c.Instances[0], fmt.Sprintf("flynn-host inspect %s", id)); err != nil {
+		run(instances[0], "flynn-host ps -a")
+
+		var out bytes.Buffer
+		if err := instances[0].Run("flynn-host ps -a -q", &Streams{Stdout: &out, Stderr: w}); err != nil {
+			io.Copy(w, &out)
 			fallback()
 			return
 		}
-		run(c.Instances[0], fmt.Sprintf("flynn-host log --init %s", id))
+
+		ids := strings.Split(strings.TrimSpace(out.String()), "\n")
+		for _, id := range ids {
+			if err := run(instances[0], fmt.Sprintf("flynn-host inspect %s", id)); err != nil {
+				fallback()
+				return
+			}
+			run(instances[0], fmt.Sprintf("flynn-host log --init %s", id))
+		}
+	}
+	printLogs(c.defaultInstances)
+	if len(c.releaseInstances) > 0 {
+		printLogs(c.releaseInstances)
 	}
 }

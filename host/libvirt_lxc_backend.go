@@ -27,6 +27,7 @@ import (
 	"github.com/flynn/flynn/host/containerinit"
 	lt "github.com/flynn/flynn/host/libvirt"
 	"github.com/flynn/flynn/host/logbuf"
+	"github.com/flynn/flynn/host/logmux"
 	"github.com/flynn/flynn/host/types"
 	"github.com/flynn/flynn/host/volume/manager"
 	"github.com/flynn/flynn/pinkerton"
@@ -43,7 +44,7 @@ const (
 	imageRoot      = "/var/lib/docker"
 )
 
-func NewLibvirtLXCBackend(state *State, vman *volumemanager.Manager, volPath, logPath, initPath string) (Backend, error) {
+func NewLibvirtLXCBackend(state *State, vman *volumemanager.Manager, volPath, logPath, initPath string, mux *logmux.LogMux) (Backend, error) {
 	libvirtc, err := libvirt.NewVirConnection("lxc:///")
 	if err != nil {
 		return nil, err
@@ -65,6 +66,7 @@ func NewLibvirtLXCBackend(state *State, vman *volumemanager.Manager, volPath, lo
 		logs:       make(map[string]*logbuf.Log),
 		containers: make(map[string]*libvirtContainer),
 		resolvConf: "/etc/resolv.conf",
+		mux:        mux,
 	}, nil
 }
 
@@ -84,6 +86,7 @@ type LibvirtLXCBackend struct {
 
 	logsMtx sync.Mutex
 	logs    map[string]*logbuf.Log
+	mux     *logmux.LogMux
 
 	containersMtx sync.RWMutex
 	containers    map[string]*libvirtContainer
@@ -662,18 +665,41 @@ func (c *libvirtContainer) watch(ready chan<- error) error {
 	c.l.containers[c.job.ID] = c
 	c.l.containersMtx.Unlock()
 
-	if !c.job.Config.TTY {
+	if !c.job.Config.DisableLog && !c.job.Config.TTY {
 		g.Log(grohl.Data{"at": "get_stdout"})
 		stdout, stderr, initLog, err := c.Client.GetStreams()
 		if err != nil {
 			g.Log(grohl.Data{"at": "get_streams", "status": "error", "err": err.Error()})
 			return err
 		}
+
 		log := c.l.openLog(c.job.ID)
 		defer log.Close()
-		// TODO: log errors from these
-		go log.Follow(1, stdout)
-		go log.Follow(2, stderr)
+
+		muxConfig := logmux.Config{
+			AppID:   c.job.Metadata["flynn-controller.app"],
+			HostID:  c.l.state.id,
+			JobType: c.job.Metadata["flynn-controller.type"],
+			JobID:   c.job.ID,
+		}
+
+		// TODO(benburkert): remove file logging once attach proto uses logaggregator
+		streams := []io.Reader{stdout, stderr}
+		for i, stream := range streams {
+			bufr, bufw := io.Pipe()
+			muxr, muxw := io.Pipe()
+			go func(r io.Reader, pw1, pw2 *io.PipeWriter) {
+				mw := io.MultiWriter(pw1, pw2)
+				_, err := io.Copy(mw, r)
+				pw1.CloseWithError(err)
+				pw2.CloseWithError(err)
+			}(stream, bufw, muxw)
+
+			fd := i + 1
+			go log.Follow(fd, bufr)
+			go c.l.mux.Follow(muxr, fd, muxConfig)
+		}
+
 		go log.Follow(3, initLog)
 	}
 
@@ -862,6 +888,32 @@ func (l *LibvirtLXCBackend) Attach(req *AttachRequest) (err error) {
 			io.Copy(stdinPipe, req.Stdin)
 			stdinPipe.Close()
 		}()
+	}
+
+	if req.Job.Job.Config.DisableLog {
+		stdout, stderr, initLog, err := client.GetStreams()
+		if err != nil {
+			return err
+		}
+		if req.Attached != nil {
+			req.Attached <- struct{}{}
+		}
+		var wg sync.WaitGroup
+		cp := func(w io.Writer, r io.Reader) {
+			if w == nil {
+				w = ioutil.Discard
+			}
+			wg.Add(1)
+			go func() {
+				io.Copy(w, r)
+				wg.Done()
+			}()
+		}
+		cp(req.InitLog, initLog)
+		cp(req.Stdout, stdout)
+		cp(req.Stderr, stderr)
+		wg.Wait()
+		return io.EOF
 	}
 
 	if req.Attached != nil {

@@ -70,7 +70,7 @@ func (r *JobRepo) Add(job *ct.Job) error {
 	// TODO: actually validate
 	err = r.db.QueryRow("INSERT INTO job_cache (job_id, host_id, app_id, release_id, process_type, state, meta) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING created_at, updated_at",
 		jobID, hostID, job.AppID, job.ReleaseID, job.Type, job.State, meta).Scan(&job.CreatedAt, &job.UpdatedAt)
-	if e, ok := err.(*pq.Error); ok && e.Code.Name() == "unique_violation" {
+	if postgres.IsUniquenessError(err, "") {
 		err = r.db.QueryRow("UPDATE job_cache SET state = $3, updated_at = now() WHERE job_id = $1 AND host_id = $2 RETURNING created_at, updated_at",
 			jobID, hostID, job.State).Scan(&job.CreatedAt, &job.UpdatedAt)
 		if e, ok := err.(*pq.Error); ok && e.Code.Name() == "check_violation" {
@@ -83,10 +83,10 @@ func (r *JobRepo) Add(job *ct.Job) error {
 
 	// create a job event, ignoring possible duplications
 	err = r.db.Exec("INSERT INTO job_events (job_id, host_id, app_id, state) VALUES ($1, $2, $3, $4)", jobID, hostID, job.AppID, job.State)
-	if e, ok := err.(*pq.Error); !ok || e.Code.Name() != "unique_violation" {
-		return err
+	if postgres.IsUniquenessError(err, "") {
+		return nil
 	}
-	return nil
+	return err
 }
 
 func scanJob(s postgres.Scanner) (*ct.Job, error) {
@@ -239,75 +239,6 @@ func (c *controllerAPI) PutJob(ctx context.Context, w http.ResponseWriter, req *
 	httphelper.JSON(w, 200, &job)
 }
 
-func (c *controllerAPI) JobLog(ctx context.Context, w http.ResponseWriter, req *http.Request) {
-	hc, jobID, err := c.connectHost(ctx)
-	if err != nil {
-		respondWithError(w, err)
-		return
-	}
-
-	attachReq := &host.AttachReq{
-		JobID: jobID,
-		Flags: host.AttachFlagStdout | host.AttachFlagStderr | host.AttachFlagLogs,
-	}
-	tail := req.FormValue("tail") != ""
-	if tail {
-		attachReq.Flags |= host.AttachFlagStream
-	}
-	wait := req.FormValue("wait") != ""
-	attachClient, err := hc.Attach(attachReq, wait)
-	if err != nil {
-		if err == cluster.ErrWouldWait {
-			w.WriteHeader(404)
-		} else {
-			respondWithError(w, err)
-		}
-		return
-	}
-
-	if cn, ok := w.(http.CloseNotifier); ok {
-		go func() {
-			<-cn.CloseNotify()
-			attachClient.Close()
-		}()
-	} else {
-		defer attachClient.Close()
-	}
-
-	if strings.Contains(req.Header.Get("Accept"), "text/event-stream") {
-		ch := make(chan *sseLogChunk)
-		l, _ := ctxhelper.LoggerFromContext(ctx)
-		s := sse.NewStream(w, ch, l)
-		defer s.Close()
-		s.Serve()
-		exit, err := attachClient.Receive(&sseLogStream{Name: "stdout", Chan: ch}, &sseLogStream{Name: "stderr", Chan: ch})
-		if err != nil {
-			if errBytes, err := json.Marshal(err); err != nil {
-				ch <- &sseLogChunk{Event: "error", Data: errBytes}
-			}
-			return
-		}
-		if tail {
-			// Send eof if we don't know the exit code
-			if exit != -1 {
-				ch <- &sseLogChunk{Event: "exit", Data: []byte(fmt.Sprintf(`{"status": %d}`, exit))}
-				return
-			}
-		}
-		ch <- &sseLogChunk{Event: "eof"}
-	} else {
-		w.Header().Set("Content-Type", "application/vnd.flynn.attach")
-		w.WriteHeader(200)
-		// Send headers right away if tailing
-		if wf, ok := w.(http.Flusher); ok && tail {
-			wf.Flush()
-		}
-
-		fw := httphelper.FlushWriter{Writer: w, Enabled: tail}
-		io.Copy(fw, attachClient.Conn())
-	}
-}
-
 func streamJobs(ctx context.Context, req *http.Request, w http.ResponseWriter, app *ct.App, repo *JobRepo) (err error) {
 	var lastID int64
 	if req.Header.Get("Last-Event-Id") != "" {
@@ -434,7 +365,24 @@ func (c *controllerAPI) RunJob(ctx context.Context, w http.ResponseWriter, req *
 	artifact := data.(*ct.Artifact)
 	attach := strings.Contains(req.Header.Get("Upgrade"), "flynn-attach/0")
 
-	env := make(map[string]string, len(release.Env)+len(newJob.Env))
+	hosts, err := c.clusterClient.ListHosts()
+	if err != nil {
+		respondWithError(w, err)
+		return
+	}
+	if len(hosts) == 0 {
+		respondWithError(w, errors.New("no hosts found"))
+		return
+	}
+	hostID := schedutil.PickHost(hosts).ID
+
+	id := cluster.RandomJobID("")
+	app := c.getApp(ctx)
+	env := make(map[string]string, len(release.Env)+len(newJob.Env)+4)
+	env["FLYNN_APP_ID"] = app.ID
+	env["FLYNN_RELEASE_ID"] = release.ID
+	env["FLYNN_PROCESS_TYPE"] = ""
+	env["FLYNN_JOB_ID"] = hostID + "-" + id
 	if newJob.ReleaseEnv {
 		for k, v := range release.Env {
 			env[k] = v
@@ -447,39 +395,27 @@ func (c *controllerAPI) RunJob(ctx context.Context, w http.ResponseWriter, req *
 	for k, v := range newJob.Meta {
 		metadata[k] = v
 	}
-	app := c.getApp(ctx)
 	metadata["flynn-controller.app"] = app.ID
 	metadata["flynn-controller.app_name"] = app.Name
 	metadata["flynn-controller.release"] = release.ID
 	job := &host.Job{
-		ID:       cluster.RandomJobID(""),
+		ID:       id,
 		Metadata: metadata,
 		Artifact: host.Artifact{
 			Type: artifact.Type,
 			URI:  artifact.URI,
 		},
 		Config: host.ContainerConfig{
-			Cmd:   newJob.Cmd,
-			Env:   env,
-			TTY:   newJob.TTY,
-			Stdin: attach,
+			Cmd:        newJob.Cmd,
+			Env:        env,
+			TTY:        newJob.TTY,
+			Stdin:      attach,
+			DisableLog: newJob.DisableLog,
 		},
 	}
 	if len(newJob.Entrypoint) > 0 {
 		job.Config.Entrypoint = newJob.Entrypoint
 	}
-
-	hosts, err := c.clusterClient.ListHosts()
-	if err != nil {
-		respondWithError(w, err)
-		return
-	}
-	if len(hosts) == 0 {
-		respondWithError(w, errors.New("no hosts found"))
-		return
-	}
-
-	hostID := schedutil.PickHost(hosts).ID
 
 	var attachClient cluster.AttachClient
 	if attach {
